@@ -125,6 +125,16 @@ All notable changes to `blew` are documented here. Format follows
 
 ### Fixed
 
+- **Apple: the L2CAP reactor no longer spins at 100% CPU once its last
+  channel closes, and an application `write()` wakes it at once.**
+  ([#55](https://github.com/mcginty/blew/issues/55)) The reactor thread's
+  run loop had no input sources besides the channels' streams, so with no
+  channel registered `acceptInputForMode:beforeDate:` returned immediately
+  and the reactor busy-looped for the rest of the process. Separately, the
+  `CFRunLoopWakeUp` that was meant to interrupt the wait for outbound data
+  never ended it, so writes waited for a stream event or the 1 s backstop.
+  The reactor now owns a permanent `CFRunLoopSource` that keeps the run loop
+  able to sleep, and a wake signals it, which ends the wait.
 - **Apple: writes without response wait for CoreBluetooth to have room,
   instead of being dropped.** The central sent every no-response write at
   once and returned `Ok`. When `canSendWriteWithoutResponse` is false,

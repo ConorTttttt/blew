@@ -32,7 +32,9 @@ use objc2::rc::{Retained, autoreleasepool};
 use objc2::runtime::{NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{AnyThread, DefinedClass, define_class};
 use objc2_core_bluetooth::CBL2CAPChannel;
-use objc2_core_foundation::{CFRetained, CFRunLoop};
+use objc2_core_foundation::{
+    CFRetained, CFRunLoop, CFRunLoopSource, CFRunLoopSourceContext, kCFRunLoopDefaultMode,
+};
 use objc2_foundation::{
     NSDate, NSDefaultRunLoopMode, NSInputStream, NSOutputStream, NSRunLoop, NSStream,
     NSStreamDelegate, NSStreamEvent, NSStreamStatus,
@@ -63,14 +65,67 @@ static NEXT_CHANNEL_ID: AtomicU64 = AtomicU64::new(1);
 static REACTOR_RUN_LOOP: OnceLock<SendRunLoop> = OnceLock::new();
 static REACTOR_READY: OnceLock<ReadySet> = OnceLock::new();
 
-/// The reactor thread's run loop, so other threads can pull it out of its wait.
+/// The reactor thread's run loop and its wake source, so other threads can
+/// pull it out of its wait.
+///
+/// The source is what makes both waking and sleeping work, for two separate
+/// reasons (#55):
+/// - `acceptInputForMode:beforeDate:` returns at once when the mode has no
+///   sources, and otherwise the only sources are the channels' streams. So
+///   with no channel registered -- including for the rest of the process once
+///   the last one closes -- the reactor would spin at full CPU.
+/// - It returns early only once it has *handled* a source. `CFRunLoopWakeUp`
+///   alone makes the run loop re-check and go back to sleep until the
+///   deadline; a signalled source is what it handles.
 ///
 /// # Safety
-/// `CFRunLoopWakeUp` is one of the few run-loop calls Apple documents as safe
-/// to make from any thread; nothing else is done with this handle.
-struct SendRunLoop(CFRetained<CFRunLoop>);
+/// `CFRunLoopSourceSignal` and `CFRunLoopWakeUp` are the run-loop calls Apple
+/// documents as safe to make from any thread; nothing else is done with these
+/// handles off the reactor thread.
+struct SendRunLoop {
+    run_loop: CFRetained<CFRunLoop>,
+    wake_source: CFRetained<CFRunLoopSource>,
+}
 unsafe impl Send for SendRunLoop {}
 unsafe impl Sync for SendRunLoop {}
+
+impl SendRunLoop {
+    /// Attach a wake source to the current thread's run loop.
+    fn install() -> Option<Self> {
+        let run_loop = CFRunLoop::current()?;
+        let mut context = CFRunLoopSourceContext {
+            version: 0,
+            info: std::ptr::null_mut(),
+            retain: None,
+            release: None,
+            copyDescription: None,
+            equal: None,
+            hash: None,
+            schedule: None,
+            cancel: None,
+            perform: Some(wake_source_perform),
+        };
+        // `CFRunLoopSourceCreate` copies the context, so it may live on the
+        // stack.
+        let wake_source = unsafe { CFRunLoopSource::new(None, 0, &raw mut context) }?;
+        run_loop.add_source(Some(&wake_source), unsafe { kCFRunLoopDefaultMode });
+        Some(Self {
+            run_loop,
+            wake_source,
+        })
+    }
+
+    fn wake(&self) {
+        // Signal first: a wake delivered while the reactor is between passes
+        // stays latched on the source, so the next wait handles it and
+        // returns immediately rather than sleeping through the work.
+        self.wake_source.signal();
+        self.run_loop.wake_up();
+    }
+}
+
+/// Nothing to do: handling the source is itself what ends the wait.
+unsafe extern "C-unwind" fn wake_source_perform(_info: *mut std::ffi::c_void) {}
 
 /// Pull the reactor out of `acceptInputForMode:beforeDate:`.
 ///
@@ -80,10 +135,7 @@ unsafe impl Sync for SendRunLoop {}
 /// outbound write would wait for the idle backstop.
 fn wake_reactor() {
     if let Some(run_loop) = REACTOR_RUN_LOOP.get() {
-        // Safe against the obvious race: a wake delivered while the reactor is
-        // between passes latches on the run loop's wakeup port, so the next
-        // wait returns immediately rather than sleeping through the work.
-        run_loop.0.wake_up();
+        run_loop.wake();
     }
 }
 
@@ -445,10 +497,10 @@ impl L2capReactor {
             let run_loop = NSRunLoop::currentRunLoop();
             // Publish before servicing anything, so a wake that races startup
             // is not lost.
-            if let Some(cf) = CFRunLoop::current() {
-                let _ = REACTOR_RUN_LOOP.set(SendRunLoop(cf));
+            if let Some(cf) = SendRunLoop::install() {
+                let _ = REACTOR_RUN_LOOP.set(cf);
             } else {
-                warn!("apple L2CAP reactor has no CFRunLoop; falling back to idle polling");
+                warn!("apple L2CAP reactor has no wake source; falling back to idle polling");
             }
             loop {
                 autoreleasepool(|_| {
@@ -851,5 +903,68 @@ mod tests {
             ..Default::default()
         };
         assert!(queue_capacity(&config) >= MIN_QUEUE_CHUNKS);
+    }
+
+    /// Run `f` on a fresh thread, whose run loop has no sources of its own --
+    /// the state the reactor is in with no channels registered.
+    fn on_fresh_run_loop<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> T {
+        std::thread::spawn(move || autoreleasepool(|_| f()))
+            .join()
+            .expect("run loop thread panicked")
+    }
+
+    #[test]
+    fn idle_wait_blocks_with_no_channels() {
+        let elapsed = on_fresh_run_loop(|| {
+            let run_loop = NSRunLoop::currentRunLoop();
+            let _wake = SendRunLoop::install().expect("thread has a CFRunLoop");
+            let start = Instant::now();
+            L2capReactor::wait_for_work(&run_loop, 0.3);
+            start.elapsed()
+        });
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "idle wait returned after {elapsed:?}; the reactor would spin"
+        );
+    }
+
+    #[test]
+    fn wake_up_interrupts_the_idle_wait() {
+        let elapsed = on_fresh_run_loop(|| {
+            let run_loop = NSRunLoop::currentRunLoop();
+            let wake = Arc::new(SendRunLoop::install().expect("thread has a CFRunLoop"));
+            let waker = {
+                let wake = Arc::clone(&wake);
+                std::thread::spawn(move || {
+                    std::thread::sleep(Duration::from_millis(50));
+                    wake.wake();
+                })
+            };
+            let start = Instant::now();
+            L2capReactor::wait_for_work(&run_loop, 5.0);
+            let elapsed = start.elapsed();
+            waker.join().expect("waker panicked");
+            elapsed
+        });
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "wake_up did not interrupt the wait ({elapsed:?})"
+        );
+    }
+
+    #[test]
+    fn a_wake_before_the_wait_is_not_lost() {
+        let elapsed = on_fresh_run_loop(|| {
+            let run_loop = NSRunLoop::currentRunLoop();
+            let wake = SendRunLoop::install().expect("thread has a CFRunLoop");
+            wake.wake();
+            let start = Instant::now();
+            L2capReactor::wait_for_work(&run_loop, 5.0);
+            start.elapsed()
+        });
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a latched wake was lost ({elapsed:?})"
+        );
     }
 }
