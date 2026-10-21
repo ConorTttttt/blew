@@ -123,6 +123,13 @@ All notable changes to `blew` are documented here. Format follows
   `Sent`: CoreBluetooth has no indication confirmation, and BlueZ's D-Bus API
   reports a confirmed indication and a timed-out one the same way.
 
+- **Android: the Gradle module follows the Tauri 2.12 plugin template.** It
+  sets the JVM target through `kotlin { compilerOptions { … } }` instead of
+  `kotlinOptions`, which Kotlin 2.3+ rejects with a hard error. It also drops
+  the `buildTypes { release { … } }` block, which pointed at a
+  `proguard-rules.pro` that never existed, and ships the `consumer-rules.pro`
+  that `consumerProguardFiles` already named.
+
 ### Fixed
 
 - **Apple: the L2CAP reactor no longer spins at 100% CPU once its last
