@@ -14,7 +14,7 @@ categories = ["hardware-support", "network-programming"]
 tauri-plugin = { version = "2", features = ["build"] }
 
 [dependencies]
-tauri = "2"
+tauri = "2.12"
 tracing = "0.1"
 
 [target.'cfg(target_os = "android")'.dependencies]

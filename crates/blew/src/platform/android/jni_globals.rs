@@ -26,8 +26,8 @@ pub fn init_jvm(vm: JavaVM) {
         return;
     }
     vm.attach_current_thread(|env| {
-        // The application context, not an Activity -- see
-        // `tauri-plugin-blew`'s `install_android_context`.
+        // The application context, not an Activity: tao's activity
+        // `onCreate` publishes the Application.
         let context =
             unsafe { JObject::from_raw(env, ndk_context::android_context().context().cast()) };
         let class_loader = env

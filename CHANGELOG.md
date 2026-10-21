@@ -60,14 +60,13 @@ All notable changes to `blew` are documented here. Format follows
   advertising on the Peripheral's `AdapterStateChanged`.
 
 - **tauri-plugin-blew: `install_android_context_once()` lets a host publish
-  `ndk_context` before any activity exists.** `ndk_context` aborts on a second
-  publish, so a host that published the context itself — for example from an
-  FCM service in a process Android started with no activity — had the plugin's
-  own publish in `setup` abort the app at launch. The plugin now publishes at
-  most once per process, and `setup` does nothing further when a host already
-  went through `install_android_context_once`. Every publisher in the process
-  must use it; a direct `ndk_context::initialize_android_context` still
-  collides.
+  `ndk_context` before any activity exists.** It is for hosts that run Rust in
+  a process Android started with no activity, such as an FCM service.
+  `ndk_context` aborts on a second publish, so every host publisher in the
+  process must go through it. It cannot coordinate with tao, though: since
+  tao 0.37 (Tauri 2.12) every activity's `onCreate` publishes unconditionally,
+  so if an activity later starts in the same process, tao's publish aborts the
+  app. Only call it where no activity ever will start.
 
 ### Changed
 
@@ -131,6 +130,14 @@ All notable changes to `blew` are documented here. Format follows
   that `consumerProguardFiles` already named.
 
 ### Fixed
+
+- **tauri-plugin-blew: no longer aborts every Android launch on Tauri 2.12.**
+  ([#56](https://github.com/mcginty/blew/issues/56)) tao 0.37 publishes
+  `ndk_context` itself in the activity's `onCreate`, and the plugin's `setup`
+  published it again; `ndk_context` aborts on a second publish
+  (`assertion failed: previous.is_none()`). `setup` now only reads back what
+  tao published, and the plugin requires `tauri >= 2.12`, since on 2.11
+  nothing publishes. See the upgrade guide below.
 
 - **Apple: the L2CAP reactor no longer spins at 100% CPU once its last
   channel closes, and an application `write()` wakes it at once.**
@@ -1213,6 +1220,25 @@ defaultConfig { minSdk = 33 }
 ```
 
 blew never worked below 33: its first GATT write threw `NoSuchMethodError`.
+
+---
+
+## Upgrade guide — `tauri-plugin-blew` requires Tauri 2.12
+
+**If your app is on Tauri 2.11 or earlier**, upgrade it. The plugin now relies
+on tao 0.37 (Tauri 2.12) publishing `ndk_context` before plugin `setup`, and
+on 2.11 `setup` panics because nothing has.
+
+```toml
+# Before
+tauri = "2.11"
+
+# After
+tauri = "2.12"
+```
+
+If you call `install_android_context_once()`, make sure no activity can start
+in that process afterwards: tao's own publish would abort it.
 
 ---
 

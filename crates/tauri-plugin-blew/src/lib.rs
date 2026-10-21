@@ -11,12 +11,6 @@ use tokio::sync::broadcast;
 #[cfg(target_os = "android")]
 const PLUGIN_IDENTIFIER: &str = "org.jakebot.blew";
 
-/// How long plugin setup waits for the Android main thread to run the closure
-/// that hands back the JVM and activity. Generous: this runs once at startup,
-/// and the only thing a shorter deadline buys is a faster failure.
-#[cfg(target_os = "android")]
-const DISPATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-
 #[cfg(target_os = "android")]
 static AUTO_REQUEST_PERMISSIONS: AtomicBool = AtomicBool::new(true);
 
@@ -228,7 +222,7 @@ pub fn init_with_config<R: Runtime>(config: BlewPluginConfig) -> TauriPlugin<R> 
         .setup(|_app, api| {
             #[cfg(target_os = "android")]
             {
-                let vm_ptr = install_android_context()?;
+                let vm_ptr = android_vm();
                 let vm = unsafe { jni::JavaVM::from_raw(vm_ptr.cast()) };
                 blew::platform::android::init_jvm(vm);
                 api.register_android_plugin(PLUGIN_IDENTIFIER, "BlewPlugin")?;
@@ -239,14 +233,19 @@ pub fn init_with_config<R: Runtime>(config: BlewPluginConfig) -> TauriPlugin<R> 
         .build()
 }
 
-/// Publish `ndk_context` for this process, once. Later calls, including the
-/// plugin's own `setup`, do nothing.
+/// Publish `ndk_context` for this process, once. Later calls do nothing.
 ///
 /// For hosts that run Rust in a process no activity has started, such as an
 /// FCM service. `ndk_context` aborts on a second publish and offers no way to
-/// ask whether one happened, so every publisher in the process must come
-/// through here: a direct `ndk_context::initialize_android_context` elsewhere
-/// still collides with the plugin's.
+/// ask whether one happened, so every host publisher in the process must come
+/// through here.
+///
+/// **This cannot coordinate with tao.** Since tao 0.37 (Tauri 2.12), every
+/// activity's `onCreate` publishes `ndk_context` unconditionally, so if an
+/// activity starts in a process after this was called, tao's publish aborts
+/// the app. On Android an activity can start in any process, so only call
+/// this where you know none ever will. The plugin's own `setup` never
+/// publishes; it reads back what tao published.
 ///
 /// # Safety
 ///
@@ -262,77 +261,13 @@ pub unsafe fn install_android_context_once(
     });
 }
 
-// Tauri 2.11 (tao 0.35) no longer calls `ndk_context::initialize_android_context`,
-// so we install it ourselves before init_jvm runs — both blew and `hickory-resolver`
-// (iroh's DNS dep on Android) read the JVM/activity through ndk_context.
+// tao >= 0.37 publishes ndk_context in the activity's `onCreate`, before any
+// plugin setup runs, and ndk_context aborts on a second publish -- so setup
+// only reads it back. Both blew and `hickory-resolver` (iroh's DNS dep on
+// Android) read the JVM and the application context through it.
 #[cfg(target_os = "android")]
-fn install_android_context() -> Result<*mut std::ffi::c_void, Box<dyn std::error::Error>> {
-    use std::ffi::c_void;
-    use std::sync::mpsc;
-    use tauri::wry::prelude::{dispatch, jni as wry_jni};
-
-    if ANDROID_CONTEXT.is_completed() {
-        return Ok(ndk_context::android_context().vm());
-    }
-
-    let (tx, rx) = mpsc::channel();
-    dispatch(move |env, activity, _webview| {
-        let result: Result<_, wry_jni::errors::Error> = (|| {
-            let vm = env.get_java_vm()?;
-            // The *application* context, not the Activity. ndk_context holds
-            // whatever it is given for the life of the process, and an Activity
-            // held that long drags its entire view hierarchy -- WebView
-            // included -- past every recreation. Nothing that reads this back
-            // needs an Activity: both consumers in this workspace want a
-            // classloader, and the Application's is the same one.
-            let app_context = env
-                .call_method(
-                    activity,
-                    "getApplicationContext",
-                    "()Landroid/content/Context;",
-                    &[],
-                )?
-                .l()?;
-            let context_global = env.new_global_ref(app_context)?;
-            Ok((vm, context_global))
-        })();
-        let _ = tx.send(result);
-    });
-    // Bounded on purpose. `dispatch` hands the closure to the Android main
-    // thread, so this blocks until that thread runs it -- and if it never does
-    // (it is already blocked, or wry changes how dispatch is scheduled) an
-    // unbounded wait here is a silent hang at startup with no log and no
-    // error, on a device, which is close to undiagnosable. A timeout turns
-    // that into a plugin-setup failure that says what happened.
-    let (vm, context_global) = rx
-        .recv_timeout(DISPATCH_TIMEOUT)
-        .map_err(|e| {
-            format!(
-                "wry JNI dispatch did not run within {DISPATCH_TIMEOUT:?}: {e} \
-                 (is the Android main thread blocked?)"
-            )
-        })?
-        .map_err(|e| format!("JNI error capturing JVM/activity: {e}"))?;
-
-    let vm_ptr = vm.get_java_vm_pointer() as *mut c_void;
-    let context_ptr = context_global.as_obj().as_raw() as *mut c_void;
-    let mut published = false;
-    ANDROID_CONTEXT.call_once(|| {
-        unsafe {
-            ndk_context::initialize_android_context(vm_ptr, context_ptr);
-        }
-        published = true;
-    });
-    if published {
-        // ndk_context borrows the context for the lifetime of the process; leak
-        // the global ref so the JNI ref the pointer refers to is never freed.
-        // The Application object lives that long anyway, so unlike an Activity
-        // nothing is kept alive that would otherwise have been collected.
-        std::mem::forget(context_global);
-    }
-    // Otherwise a host published between the check above and here, and our
-    // global ref drops unused.
-    Ok(vm_ptr)
+fn android_vm() -> *mut std::ffi::c_void {
+    ndk_context::android_context().vm()
 }
 
 /// JNI entry point invoked from `BlewPluginNative.autoRequestPermissionsEnabled()`
