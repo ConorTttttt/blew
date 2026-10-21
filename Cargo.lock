@@ -3568,7 +3568,7 @@ dependencies = [
 
 [[package]]
 name = "tauri-plugin-blew"
-version = "0.5.1-beta.7"
+version = "0.5.1-beta.8"
 dependencies = [
  "blew",
  "jni 0.22.4",
