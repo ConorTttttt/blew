@@ -3,8 +3,8 @@
 //! Static characteristics remain supported; empty readable values are handled
 //! dynamically via PeripheralRequest::Read. Writes flow through the existing
 //! responder-based PeripheralRequest::Write API, with a bounded ATT response.
-//! Secondary services, notifications/indications, descriptors, and custom local
-//! advertisement names are not yet supported. Not ready for Iroh traffic yet.
+//! Secondary services, descriptors, and custom local advertisement names are
+//! not yet supported. Iroh endpoint-discovery compatibility is the next step.
 
 use crate::error::{BlewError, BlewResult};
 use crate::gatt::props::{AttributePermissions, CharacteristicProperties};
@@ -20,21 +20,22 @@ use crate::types::DeviceId;
 use crate::util::BroadcastEventStream;
 use parking_lot::Mutex;
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use uuid::Uuid;
 use windows::Devices::Bluetooth::GenericAttributeProfile::{
-    GattCharacteristicProperties, GattLocalCharacteristic, GattLocalCharacteristicParameters,
-    GattProtectionLevel, GattReadRequest, GattReadRequestedEventArgs, GattServiceProvider,
-    GattServiceProviderAdvertisingParameters, GattWriteOption, GattWriteRequest,
-    GattWriteRequestedEventArgs,
+    GattCharacteristicProperties, GattCommunicationStatus, GattLocalCharacteristic,
+    GattLocalCharacteristicParameters, GattProtectionLevel, GattReadRequest,
+    GattReadRequestedEventArgs, GattServiceProvider, GattServiceProviderAdvertisingParameters,
+    GattWriteOption, GattWriteRequest, GattWriteRequestedEventArgs,
 };
 use windows::Devices::Bluetooth::{BluetoothAdapter, BluetoothError};
 use windows::Foundation::{Deferral, TypedEventHandler};
 use windows::Storage::Streams::{DataReader, DataWriter};
-use windows::core::{GUID, Interface};
+use windows::core::{GUID, IInspectable, Interface};
 use windows_future::IAsyncOperation;
 
 /// Windows expects the request deferral to remain alive until the ATT
@@ -52,6 +53,10 @@ struct LocalBinding {
     characteristic: GattLocalCharacteristic,
     read_token: Option<i64>,
     write_token: Option<i64>,
+    subscription_token: Option<i64>,
+    known_subscribers: Option<Arc<Mutex<HashSet<DeviceId>>>>,
+    events: broadcast::Sender<PeripheralStateEvent>,
+    char_uuid: Uuid,
 }
 
 impl Drop for LocalBinding {
@@ -61,6 +66,20 @@ impl Drop for LocalBinding {
         }
         if let Some(token) = self.write_token.take() {
             let _ = self.characteristic.RemoveWriteRequested(token);
+        }
+        if let Some(token) = self.subscription_token.take() {
+            let _ = self.characteristic.RemoveSubscribedClientsChanged(token);
+        }
+        // Subscribers must not remain visible to Iroh after stop_advertising.
+        if let Some(known) = self.known_subscribers.take() {
+            let removed = std::mem::take(&mut *known.lock());
+            for client_id in removed {
+                let _ = self.events.send(PeripheralStateEvent::SubscriptionChanged {
+                    client_id,
+                    char_uuid: self.char_uuid,
+                    subscribed: false,
+                });
+            }
         }
     }
 }
@@ -115,16 +134,18 @@ fn unsupported(message: impl Into<String>) -> BlewError {
     BlewError::Internal(format!("Windows GATT server Stage 4b: {}", message.into()))
 }
 
-/// Only expose GATT properties that Stage 4b can actually honor.
-/// Notification and indication bits are refused until subscribers and sending
-/// are implemented; declaring them now would break Iroh silently.
+/// Only expose properties that the Windows server can actually honor.
+/// Client subscriptions and targeted notifications are supported; secondary
+/// service semantics remain unsupported, so Iroh startup is not yet ready.
 fn validate_service(service: &GattService) -> BlewResult<()> {
     if !service.primary {
         return Err(BlewError::NotSupported);
     }
     let allowed = CharacteristicProperties::READ
         | CharacteristicProperties::WRITE
-        | CharacteristicProperties::WRITE_WITHOUT_RESPONSE;
+        | CharacteristicProperties::WRITE_WITHOUT_RESPONSE
+        | CharacteristicProperties::NOTIFY
+        | CharacteristicProperties::INDICATE;
     let mut seen = HashSet::new();
     for characteristic in &service.characteristics {
         if !seen.insert(characteristic.uuid) {
@@ -283,6 +304,55 @@ async fn process_write(
     }
 }
 
+/// WinRT gives us the current complete subscribed-client set, rather than
+/// individual add/remove events. Diff snapshots to emit blew's edge events.
+fn install_subscribed_handler(
+    characteristic: &GattLocalCharacteristic,
+    char_uuid: Uuid,
+    events: broadcast::Sender<PeripheralStateEvent>,
+    known: Arc<Mutex<HashSet<DeviceId>>>,
+) -> BlewResult<i64> {
+    characteristic
+        .SubscribedClientsChanged(
+            &TypedEventHandler::<GattLocalCharacteristic, IInspectable>::new(
+                move |sender, _args| {
+                    let Some(sender) = sender.as_ref() else {
+                        return Ok(());
+                    };
+                    let clients = sender.SubscribedClients()?;
+                    let mut current = HashSet::new();
+                    for i in 0..clients.Size()? {
+                        let client = clients.GetAt(i)?;
+                        current.insert(client_id_for_session(&client.Session()?)?);
+                    }
+                    let (removed, added) = {
+                        let mut previous = known.lock();
+                        let removed = previous.difference(&current).cloned().collect::<Vec<_>>();
+                        let added = current.difference(&previous).cloned().collect::<Vec<_>>();
+                        *previous = current;
+                        (removed, added)
+                    };
+                    for client_id in removed {
+                        let _ = events.send(PeripheralStateEvent::SubscriptionChanged {
+                            client_id,
+                            char_uuid,
+                            subscribed: false,
+                        });
+                    }
+                    for client_id in added {
+                        let _ = events.send(PeripheralStateEvent::SubscriptionChanged {
+                            client_id,
+                            char_uuid,
+                            subscribed: true,
+                        });
+                    }
+                    Ok(())
+                },
+            ),
+        )
+        .map_err(peripheral_error)
+}
+
 fn install_read_handler(
     characteristic: &GattLocalCharacteristic,
     service_uuid: Uuid,
@@ -375,6 +445,7 @@ async fn build_provider(
     service: &GattService,
     tx: &mpsc::UnboundedSender<PeripheralRequest>,
     runtime: &Handle,
+    events: &broadcast::Sender<PeripheralStateEvent>,
 ) -> BlewResult<(GattServiceProvider, Vec<LocalBinding>)> {
     let result = GattServiceProvider::CreateAsync(GUID::from_u128(service.uuid.as_u128()))
         .map_err(peripheral_error)?
@@ -436,6 +507,10 @@ async fn build_provider(
             characteristic: local,
             read_token: None,
             write_token: None,
+            subscription_token: None,
+            known_subscribers: None,
+            events: events.clone(),
+            char_uuid: characteristic.uuid,
         };
         if characteristic
             .properties
@@ -460,6 +535,19 @@ async fn build_provider(
                 tx.clone(),
                 runtime.clone(),
             )?);
+        }
+        if characteristic
+            .properties
+            .intersects(CharacteristicProperties::NOTIFY | CharacteristicProperties::INDICATE)
+        {
+            let known = Arc::new(Mutex::new(HashSet::new()));
+            binding.subscription_token = Some(install_subscribed_handler(
+                &binding.characteristic,
+                characteristic.uuid,
+                events.clone(),
+                known.clone(),
+            )?);
+            binding.known_subscribers = Some(known);
         }
         bindings.push(binding);
     }
@@ -551,7 +639,7 @@ impl PeripheralBackend for WindowsPeripheral {
         };
         for service in &state.pending {
             let (provider, mut bindings) =
-                build_provider(service, &self.request_tx, &self.runtime).await?;
+                build_provider(service, &self.request_tx, &self.runtime, &self.events).await?;
             published.providers.push(provider);
             published.bindings.append(&mut bindings);
         }
@@ -585,11 +673,69 @@ impl PeripheralBackend for WindowsPeripheral {
 
     async fn notify_characteristic(
         &self,
-        _device_id: &DeviceId,
-        _char_uuid: Uuid,
-        _value: Vec<u8>,
+        device_id: &DeviceId,
+        char_uuid: Uuid,
+        value: Vec<u8>,
     ) -> BlewResult<Delivery> {
-        Err(BlewError::NotSupported)
+        // Copy the WinRT handle out of the Tokio mutex before awaiting.
+        let characteristic = {
+            let state = self.state.lock().await;
+            let published = state.published.as_ref().ok_or(BlewError::NotSupported)?;
+            published
+                .bindings
+                .iter()
+                .find(|binding| {
+                    binding.char_uuid == char_uuid && binding.subscription_token.is_some()
+                })
+                .map(|binding| binding.characteristic.clone())
+                .ok_or(BlewError::NotSupported)?
+        };
+
+        // Drop the non-Send subscriber collection and selected WinRT client
+        // before awaiting the send operation.
+        let operation = {
+            // Query Windows directly; the callback snapshot may be stale if a client
+            // disconnected while the application was preparing to send.
+            let subscribers = characteristic
+                .SubscribedClients()
+                .map_err(peripheral_error)?;
+            let mut target = None;
+            for i in 0..subscribers.Size().map_err(peripheral_error)? {
+                let candidate = subscribers.GetAt(i).map_err(peripheral_error)?;
+                let candidate_id =
+                    client_id_for_session(&candidate.Session().map_err(peripheral_error)?)
+                        .map_err(peripheral_error)?;
+                if &candidate_id == device_id {
+                    target = Some(candidate);
+                    break;
+                }
+            }
+            let Some(target) = target else {
+                return Ok(Delivery::NoSubscriber);
+            };
+            let max = target.MaxNotificationSize().map_err(peripheral_error)? as usize;
+            if value.len() > max {
+                return Err(unsupported(format!(
+                    "notification is {} bytes; Windows client permits only {max}",
+                    value.len()
+                )));
+            }
+            let writer = DataWriter::new().map_err(peripheral_error)?;
+            writer.WriteBytes(&value).map_err(peripheral_error)?;
+            let buffer = writer.DetachBuffer().map_err(peripheral_error)?;
+            characteristic
+                .NotifyValueForSubscribedClientAsync(&buffer, &target)
+                .map_err(peripheral_error)?
+        };
+        let result = operation.await.map_err(peripheral_error)?;
+        let status = result.Status().map_err(peripheral_error)?;
+        if status != GattCommunicationStatus::Success {
+            return Err(unsupported(format!(
+                "Windows GATT notification to {device_id:?} failed: {status:?}"
+            )));
+        }
+        // Windows reports the ATT write/send result, not an indication ack.
+        Ok(Delivery::Sent)
     }
 
     async fn l2cap_listener(
