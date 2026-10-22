@@ -1,8 +1,10 @@
-//! Windows BLE backend: stage 1 (advertisement scanning).
+//! Native Windows BLE backend (WinRT).
 //!
-//! GATT connections and GATT server support are deliberately NOT implemented yet.
-//! The backend returns `BlewError::NotSupported` for those operations rather than
-//! falsely reporting success. Do not use this stage for Iroh traffic.
+//! Central: scanning, GATT client operations and incoming notifications.
+//! Peripheral Stage 4a: GATT service providers and advertising for static
+//! read-only characteristics. Dynamic GATT requests/notifications, secondary
+//! services and custom local names are not supported yet.
+//! This stage is not ready for end-to-end Iroh BLE traffic.
 
 pub mod central;
 pub mod peripheral;
