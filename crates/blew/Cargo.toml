@@ -97,4 +97,5 @@ windows = { version = "0.62.2", features = [
     "Devices_Radios",
     "Foundation",
     "Foundation_Collections",
+    "Storage_Streams",
 ] }
