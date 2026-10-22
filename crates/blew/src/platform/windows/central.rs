@@ -1,5 +1,6 @@
 //! Windows central: advertisement scanning and basic WinRT GATT client.
-//! Notifications and passive disconnect detection are not implemented yet.
+//! Stage 3: WinRT GATT notifications and disconnection event handling.
+//! Hardware validation and concurrent-operation hardening are still required.
 
 use crate::central::backend::{self, CentralBackend};
 use crate::central::types::{
@@ -15,6 +16,7 @@ use crate::util::BroadcastEventStream;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 use windows::Devices::Bluetooth::Advertisement::{
@@ -22,17 +24,26 @@ use windows::Devices::Bluetooth::Advertisement::{
     BluetoothLEScanningMode,
 };
 use windows::Devices::Bluetooth::GenericAttributeProfile::{
-    GattCharacteristic as WinGattCharacteristic, GattCommunicationStatus, GattDeviceService,
-    GattWriteOption,
+    GattCharacteristic as WinGattCharacteristic,
+    GattClientCharacteristicConfigurationDescriptorValue, GattCommunicationStatus,
+    GattDeviceService, GattValueChangedEventArgs, GattWriteOption,
 };
-use windows::Devices::Bluetooth::{BluetoothAdapter, BluetoothCacheMode, BluetoothLEDevice};
+use windows::Devices::Bluetooth::{
+    BluetoothAdapter, BluetoothCacheMode, BluetoothConnectionStatus, BluetoothLEDevice,
+};
 use windows::Foundation::TypedEventHandler;
 use windows::Storage::Streams::{DataReader, DataWriter};
-use windows::core::Interface;
+use windows::core::{IInspectable, Interface};
 
 struct ScanHandle {
     watcher: BluetoothLEAdvertisementWatcher,
     received_token: i64,
+}
+
+struct WindowsSubscription {
+    characteristic: WinGattCharacteristic,
+    token: i64,
+    active: Arc<AtomicBool>,
 }
 
 struct WindowsConnection {
@@ -41,12 +52,16 @@ struct WindowsConnection {
     // Hold service handles; releasing all of them also releases the GATT session.
     services: Vec<GattDeviceService>,
     characteristics: HashMap<Uuid, WinGattCharacteristic>,
+    subscriptions: HashMap<Uuid, WindowsSubscription>,
+    status_token: i64,
+    generation: u64,
 }
 
 struct Inner {
     adapter: BluetoothAdapter,
     discovered: Mutex<HashMap<DeviceId, BleDevice>>,
     connections: Mutex<HashMap<DeviceId, WindowsConnection>>,
+    generation: AtomicU64,
     scan: Mutex<Option<ScanHandle>>,
     events: broadcast::Sender<CentralEvent>,
 }
@@ -86,6 +101,40 @@ impl Inner {
         let _ = self.events.send(CentralEvent::DeviceDiscovered(snapshot));
         Ok(())
     }
+
+    fn device_lost(&self, device_id: &DeviceId, generation: u64) {
+        let removed = {
+            let mut connections = self.connections.lock();
+            // Ignore callbacks from a previous connection to the same address.
+            if connections.get(device_id).map(|c| c.generation) != Some(generation) {
+                return;
+            }
+            connections.remove(device_id)
+        };
+        if let Some(connection) = removed {
+            close_connection(connection);
+            let _ = self.events.send(CentralEvent::DeviceDisconnected {
+                device_id: device_id.clone(),
+                cause: DisconnectCause::LinkLoss,
+            });
+        }
+    }
+}
+
+fn close_connection(connection: WindowsConnection) {
+    for subscription in connection.subscriptions.into_values() {
+        subscription.active.store(false, Ordering::Release);
+        let _ = subscription
+            .characteristic
+            .RemoveValueChanged(subscription.token);
+    }
+    let _ = connection
+        .device
+        .RemoveConnectionStatusChanged(connection.status_token);
+    for service in &connection.services {
+        let _ = service.Close();
+    }
+    let _ = connection.device.Close();
 }
 
 impl Drop for Inner {
@@ -93,6 +142,9 @@ impl Drop for Inner {
         if let Some(scan) = self.scan.get_mut().take() {
             let _ = scan.watcher.Stop();
             let _ = scan.watcher.RemoveReceived(scan.received_token);
+        }
+        for connection in self.connections.get_mut().drain().map(|(_, c)| c) {
+            close_connection(connection);
         }
     }
 }
@@ -120,6 +172,7 @@ impl CentralBackend for WindowsCentral {
             adapter,
             discovered: Mutex::new(HashMap::new()),
             connections: Mutex::new(HashMap::new()),
+            generation: AtomicU64::new(1),
             scan: Mutex::new(None),
             events,
         })))
@@ -221,14 +274,44 @@ impl CentralBackend for WindowsCentral {
         for i in 0..win_services.Size().map_err(central_error)? {
             services.push(win_services.GetAt(i).map_err(central_error)?);
         }
+        let generation = self.0.generation.fetch_add(1, Ordering::Relaxed);
+        let weak = Arc::downgrade(&self.0);
+        let id_for_callback = device_id.clone();
+        let status_token = device
+            .ConnectionStatusChanged(&TypedEventHandler::<BluetoothLEDevice, IInspectable>::new(
+                move |sender, _| {
+                    if let (Some(device), Some(inner)) = (sender.as_ref(), weak.upgrade()) {
+                        if device.ConnectionStatus()? == BluetoothConnectionStatus::Disconnected {
+                            inner.device_lost(&id_for_callback, generation);
+                        }
+                    }
+                    Ok(())
+                },
+            ))
+            .map_err(central_error)?;
         self.0.connections.lock().insert(
             device_id.clone(),
             WindowsConnection {
                 device,
                 services,
                 characteristics: HashMap::new(),
+                subscriptions: HashMap::new(),
+                status_token,
+                generation,
             },
         );
+        // The event may have fired between handler registration and insertion.
+        let disconnected = self
+            .0
+            .connections
+            .lock()
+            .get(device_id)
+            .and_then(|c| c.device.ConnectionStatus().ok())
+            == Some(BluetoothConnectionStatus::Disconnected);
+        if disconnected {
+            self.0.device_lost(device_id, generation);
+            return Err(BlewError::NotConnected(device_id.clone()));
+        }
         let _ = self.0.events.send(CentralEvent::DeviceConnected {
             device_id: device_id.clone(),
         });
@@ -242,12 +325,9 @@ impl CentralBackend for WindowsCentral {
             .lock()
             .remove(device_id)
             .ok_or_else(|| BlewError::NotConnected(device_id.clone()))?;
-        // Close locally held WinRT handles. Windows may retain the radio link if
-        // another process has an active session to the same peripheral.
-        for service in &connection.services {
-            let _ = service.Close();
-        }
-        let _ = connection.device.Close();
+        // Release subscriptions, event handlers, and WinRT handles.
+        // Windows may retain the radio link if another process uses it.
+        close_connection(connection);
         let _ = self.0.events.send(CentralEvent::DeviceDisconnected {
             device_id: device_id.clone(),
             cause: DisconnectCause::LocalClose,
@@ -403,17 +483,168 @@ impl CentralBackend for WindowsCentral {
     }
     async fn subscribe_characteristic(
         &self,
-        _device_id: &DeviceId,
-        _char_uuid: Uuid,
+        device_id: &DeviceId,
+        char_uuid: Uuid,
     ) -> BlewResult<()> {
-        Err(BlewError::NotSupported)
+        let characteristic = {
+            let connections = self.0.connections.lock();
+            let connection = connections
+                .get(device_id)
+                .ok_or_else(|| BlewError::NotConnected(device_id.clone()))?;
+            if connection.subscriptions.contains_key(&char_uuid) {
+                return Err(BlewError::AlreadySubscribed {
+                    device_id: device_id.clone(),
+                    char_uuid,
+                });
+            }
+            connection
+                .characteristics
+                .get(&char_uuid)
+                .cloned()
+                .ok_or_else(|| BlewError::CharacteristicNotFound {
+                    device_id: device_id.clone(),
+                    char_uuid,
+                })?
+        };
+        let props = CharacteristicProperties::from_bits_truncate(
+            characteristic
+                .CharacteristicProperties()
+                .map_err(central_error)?
+                .0 as u16,
+        );
+        let mode = if props.contains(CharacteristicProperties::NOTIFY) {
+            GattClientCharacteristicConfigurationDescriptorValue::Notify
+        } else if props.contains(CharacteristicProperties::INDICATE) {
+            GattClientCharacteristicConfigurationDescriptorValue::Indicate
+        } else {
+            return Err(BlewError::NotSupported);
+        };
+
+        let active = Arc::new(AtomicBool::new(true));
+        let enabled = Arc::clone(&active);
+        let events = self.0.events.clone();
+        let id = device_id.clone();
+        let token = characteristic
+            .ValueChanged(&TypedEventHandler::<
+                WinGattCharacteristic,
+                GattValueChangedEventArgs,
+            >::new(move |_, args| {
+                if !enabled.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                if let Some(args) = args.as_ref() {
+                    // COM buffers stay entirely inside this synchronous callback.
+                    let decode = (|| -> windows::core::Result<Vec<u8>> {
+                        let buffer = args.CharacteristicValue()?;
+                        let reader = DataReader::FromBuffer(&buffer)?;
+                        let mut value = vec![0u8; buffer.Length()? as usize];
+                        reader.ReadBytes(&mut value)?;
+                        Ok(value)
+                    })();
+                    match decode {
+                        Ok(value) => {
+                            if enabled.load(Ordering::Acquire) {
+                                let _ = events.send(CentralEvent::CharacteristicNotification {
+                                    device_id: id.clone(),
+                                    char_uuid,
+                                    value: bytes::Bytes::from(value),
+                                });
+                            }
+                        }
+                        Err(err) => {
+                            tracing::debug!(error = %err, "GATT notification decode failed")
+                        }
+                    }
+                }
+                Ok(())
+            }))
+            .map_err(central_error)?;
+
+        // Register the callback *before* enabling the CCCD, so the first
+        // notification cannot be lost between descriptor write and registration.
+        let operation =
+            match characteristic.WriteClientCharacteristicConfigurationDescriptorAsync(mode) {
+                Ok(op) => op,
+                Err(err) => {
+                    active.store(false, Ordering::Release);
+                    let _ = characteristic.RemoveValueChanged(token);
+                    return Err(central_error(err));
+                }
+            };
+        let status = operation.await;
+        if !matches!(&status, Ok(v) if *v == GattCommunicationStatus::Success) {
+            active.store(false, Ordering::Release);
+            let _ = characteristic.RemoveValueChanged(token);
+            let reason = match status {
+                Ok(code) => format!("Windows CCCD write status: {code:?}"),
+                Err(err) => format!("Windows CCCD write failed: {err}"),
+            };
+            return Err(BlewError::Gatt {
+                device_id: device_id.clone(),
+                source: std::io::Error::other(reason).into(),
+            });
+        }
+        let mut connections = self.0.connections.lock();
+        let Some(connection) = connections.get_mut(device_id) else {
+            active.store(false, Ordering::Release);
+            let _ = characteristic.RemoveValueChanged(token);
+            return Err(BlewError::NotConnected(device_id.clone()));
+        };
+        if connection.subscriptions.contains_key(&char_uuid) {
+            active.store(false, Ordering::Release);
+            let _ = characteristic.RemoveValueChanged(token);
+            return Err(BlewError::AlreadySubscribed {
+                device_id: device_id.clone(),
+                char_uuid,
+            });
+        }
+        connection.subscriptions.insert(
+            char_uuid,
+            WindowsSubscription {
+                characteristic,
+                token,
+                active,
+            },
+        );
+        Ok(())
     }
+
     async fn unsubscribe_characteristic(
         &self,
-        _device_id: &DeviceId,
-        _char_uuid: Uuid,
+        device_id: &DeviceId,
+        char_uuid: Uuid,
     ) -> BlewResult<()> {
-        Err(BlewError::NotSupported)
+        let subscription = {
+            let mut connections = self.0.connections.lock();
+            connections
+                .get_mut(device_id)
+                .ok_or_else(|| BlewError::NotConnected(device_id.clone()))?
+                .subscriptions
+                .remove(&char_uuid)
+                .ok_or_else(|| BlewError::CharacteristicNotFound {
+                    device_id: device_id.clone(),
+                    char_uuid,
+                })?
+        };
+        subscription.active.store(false, Ordering::Release);
+        let _ = subscription
+            .characteristic
+            .RemoveValueChanged(subscription.token);
+        let operation = subscription
+            .characteristic
+            .WriteClientCharacteristicConfigurationDescriptorAsync(
+                GattClientCharacteristicConfigurationDescriptorValue::None,
+            )
+            .map_err(central_error)?;
+        let status = operation.await.map_err(central_error)?;
+        if status != GattCommunicationStatus::Success {
+            return Err(BlewError::Gatt {
+                device_id: device_id.clone(),
+                source: std::io::Error::other(format!("Windows CCCD disable status: {status:?}",))
+                    .into(),
+            });
+        }
+        Ok(())
     }
     async fn mtu(&self, _device_id: &DeviceId) -> u16 {
         23
