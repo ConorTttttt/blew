@@ -1,0 +1,21 @@
+name: Windows BLE backend (compile-only)
+
+on:
+  push:
+    branches: [feature/windows-ble]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows-ble-check:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+          components: rustfmt
+      - name: Check Windows BLE crate
+        run: cargo check -p blew --target x86_64-pc-windows-msvc
+      - name: Check Windows scanning example
+        run: cargo check -p blew --example windows_scan --target x86_64-pc-windows-msvc

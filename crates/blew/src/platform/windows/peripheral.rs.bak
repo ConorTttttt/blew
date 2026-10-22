@@ -1,0 +1,97 @@
+//! Windows GATT peripheral role placeholder.
+//!
+//! The next milestone will implement GattServiceProvider, local characteristics,
+//! GATT request deferrals and targeted notifications. This intentionally fails
+//! all GATT operations until those semantics are implemented and tested.
+
+use crate::error::{BlewError, BlewResult};
+use crate::gatt::service::GattService;
+use crate::l2cap::{L2capChannel, types::Psm};
+use crate::peripheral::backend::{self, PeripheralBackend};
+use crate::peripheral::types::{
+    AdvertisingConfig, Delivery, PeripheralConfig, PeripheralRequest, PeripheralStateEvent,
+};
+use crate::platform::windows::{get_adapter, peripheral_error, radio_powered};
+use crate::types::DeviceId;
+use crate::util::BroadcastEventStream;
+use parking_lot::Mutex;
+use tokio::sync::{broadcast, mpsc};
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use uuid::Uuid;
+use windows::Devices::Bluetooth::BluetoothAdapter;
+
+pub struct WindowsPeripheral {
+    adapter: BluetoothAdapter,
+    events: broadcast::Sender<PeripheralStateEvent>,
+    _request_tx: mpsc::UnboundedSender<PeripheralRequest>,
+    requests: Mutex<Option<mpsc::UnboundedReceiver<PeripheralRequest>>>,
+}
+
+impl WindowsPeripheral {
+    pub async fn with_config(_config: PeripheralConfig) -> BlewResult<Self> {
+        <Self as PeripheralBackend>::new().await
+    }
+}
+
+impl backend::private::Sealed for WindowsPeripheral {}
+
+impl PeripheralBackend for WindowsPeripheral {
+    type StateEvents = BroadcastEventStream<PeripheralStateEvent>;
+    type Requests = UnboundedReceiverStream<PeripheralRequest>;
+
+    async fn new() -> BlewResult<Self> {
+        let adapter = get_adapter().await?;
+        if !adapter
+            .IsPeripheralRoleSupported()
+            .map_err(peripheral_error)?
+        {
+            return Err(BlewError::NotSupported);
+        }
+        let (events, _) = broadcast::channel(128);
+        let (tx, rx) = mpsc::unbounded_channel();
+        Ok(Self {
+            adapter,
+            events,
+            _request_tx: tx,
+            requests: Mutex::new(Some(rx)),
+        })
+    }
+
+    async fn is_powered(&self) -> BlewResult<bool> {
+        radio_powered(&self.adapter)
+    }
+    async fn add_service(&self, _service: &GattService) -> BlewResult<()> {
+        Err(BlewError::NotSupported)
+    }
+    async fn start_advertising(&self, _config: &AdvertisingConfig) -> BlewResult<()> {
+        Err(BlewError::NotSupported)
+    }
+    async fn stop_advertising(&self) -> BlewResult<()> {
+        Err(BlewError::NotSupported)
+    }
+    async fn notify_characteristic(
+        &self,
+        _device_id: &DeviceId,
+        _char_uuid: Uuid,
+        _value: Vec<u8>,
+    ) -> BlewResult<Delivery> {
+        Err(BlewError::NotSupported)
+    }
+    async fn l2cap_listener(
+        &self,
+    ) -> BlewResult<(
+        Psm,
+        tokio_stream::Empty<BlewResult<(DeviceId, L2capChannel)>>,
+    )> {
+        Err(BlewError::NotSupported)
+    }
+    fn state_events(&self) -> Self::StateEvents {
+        BroadcastEventStream::new(self.events.subscribe())
+    }
+    fn take_requests(&self) -> Option<Self::Requests> {
+        self.requests
+            .lock()
+            .take()
+            .map(UnboundedReceiverStream::new)
+    }
+}
