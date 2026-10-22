@@ -1,2 +1,5 @@
 .claude/
 /target
+
+# Local Windows BLE development backups
+crates/blew/src/platform/windows/*.rs.bak*
