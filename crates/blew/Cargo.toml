@@ -90,6 +90,7 @@ missing_panics_doc = "allow"
 default_trait_access = "allow"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+windows-future = "0.3.2"
 windows = { version = "0.62.2", features = [
     "Devices_Bluetooth",
     "Devices_Bluetooth_Advertisement",

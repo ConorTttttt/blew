@@ -155,6 +155,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "windows",
+ "windows-future",
 ]
 
 [[package]]
