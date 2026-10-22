@@ -3,8 +3,10 @@
 //! Static characteristics remain supported; empty readable values are handled
 //! dynamically via PeripheralRequest::Read. Writes flow through the existing
 //! responder-based PeripheralRequest::Write API, with a bounded ATT response.
-//! Secondary services, descriptors, and custom local advertisement names are
-//! not yet supported. Iroh endpoint-discovery compatibility is the next step.
+//! Empty secondary UUID-marker services are published as standalone primary
+//! services on Windows to support Iroh advertisement-based endpoint discovery.
+//! Nonempty secondary services, descriptors and custom names remain unsupported.
+//! The advertising visibility and hardware/runtime behavior remain unverified.
 
 use crate::error::{BlewError, BlewResult};
 use crate::gatt::props::{AttributePermissions, CharacteristicProperties};
@@ -135,10 +137,17 @@ fn unsupported(message: impl Into<String>) -> BlewError {
 }
 
 /// Only expose properties that the Windows server can actually honor.
-/// Client subscriptions and targeted notifications are supported; secondary
-/// service semantics remain unsupported, so Iroh startup is not yet ready.
+/// Client subscriptions and targeted notifications are supported. The sole
+/// secondary-service exception is an empty UUID-marker service: WinRT publishes
+/// that marker as a standalone GATT service (not a true secondary service).
 fn validate_service(service: &GattService) -> BlewResult<()> {
-    if !service.primary {
+    // WinRT GattServiceProvider exposes no secondary-service type flag.
+    // Iroh uses an EMPTY secondary service UUID as an endpoint-discovery
+    // marker. Publish that UUID as a standalone Windows GATT service so it
+    // can appear in advertisements. Do not silently reinterpret secondary
+    // services containing characteristics: those require real included-
+    // service semantics, which WinRT cannot provide here.
+    if !service.primary && !service.characteristics.is_empty() {
         return Err(BlewError::NotSupported);
     }
     let allowed = CharacteristicProperties::READ
@@ -756,5 +765,34 @@ impl PeripheralBackend for WindowsPeripheral {
             .lock()
             .take()
             .map(UnboundedReceiverStream::new)
+    }
+}
+
+// Stage 4D: compile-time-testable service-validation behavior.
+#[cfg(test)]
+mod endpoint_marker_tests {
+    use super::*;
+
+    #[test]
+    fn empty_secondary_endpoint_marker_is_accepted() {
+        let marker = GattService {
+            uuid: Uuid::nil(),
+            primary: false,
+            characteristics: Vec::new(),
+        };
+        assert!(validate_service(&marker).is_ok());
+    }
+
+    #[test]
+    fn nonempty_secondary_service_is_rejected() {
+        let marker = GattService {
+            uuid: Uuid::nil(),
+            primary: false,
+            characteristics: vec![Default::default()],
+        };
+        assert!(matches!(
+            validate_service(&marker),
+            Err(BlewError::NotSupported)
+        ));
     }
 }
